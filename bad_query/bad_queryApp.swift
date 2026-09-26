@@ -320,10 +320,10 @@ final class JadeControlServer {
         let mgDir = "/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache"
         let mgFile = "\(mgDir)/Library/Caches/com.apple.MobileGestalt.plist"
 
-        // Group-identifier route matches BQMobileGestaltModel usage.
-        var cGroup = "systemgroup.com.apple.mobilegestaltcache".utf8CString.map { Int8($0) }
-        var cPath = mgDir.utf8CString.map { Int8($0) }
-        let handle = bad_query(&cPath, false, &cGroup, true)
+        // Use the same fallback chain as any other path. Jade's gestalt
+        // model opens the SystemGroup root, then reads the plist through
+        // the extension that grants — no gestalt-specific group required.
+        let handle = openExtension(path: mgDir)
         guard handle > 0 else {
             send(conn, status: 500, json: ["error": "bad_query on gestalt group failed", "code": Int(handle)])
             return
@@ -404,9 +404,23 @@ final class JadeControlServer {
 
     // MARK: Helpers
 
+    // Mirror BQFileSystemModel.rawBadQuery: create:true skips a pre-flight
+    // lstat() that would fail from the app's own sandbox (returning -254
+    // before the extension is even attempted). On failure, fall back through
+    // the app-group route — required for App Group containers on iOS 26 and
+    // sometimes the only route that lands on Shared/SystemGroup paths too.
+    private static let appGroupIdentifier = "group.com.jason.Jade"
     private func openExtension(path: String) -> Int64 {
         var cPath = path.utf8CString.map { Int8($0) }
-        return bad_query(&cPath, false, nil, false)
+        var handle = bad_query(&cPath, true, nil, false)
+        if handle < 0 {
+            var cGroup = Self.appGroupIdentifier.utf8CString.map { Int8($0) }
+            handle = bad_query(&cPath, true, &cGroup, true)
+            if handle < 0 {
+                handle = bad_query(&cPath, true, &cGroup, false)
+            }
+        }
+        return handle
     }
 
     private static func typeStr(mode: mode_t) -> String {

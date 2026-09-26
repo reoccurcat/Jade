@@ -144,6 +144,14 @@ final class JadeControlServer {
             handleGestaltGet(req, conn: conn)
         case "POST /apps/list":
             handleAppsList(req, conn: conn)
+        case "POST /write-test":
+            handleWriteTest(req, conn: conn)
+        case "POST /write":
+            handleWrite(req, conn: conn)
+        case "POST /delete":
+            handleDelete(req, conn: conn)
+        case "POST /plist/read":
+            handlePlistRead(req, conn: conn)
         default:
             send(conn, status: 404, json: ["error": "no such route", "route": route])
         }
@@ -435,6 +443,206 @@ final class JadeControlServer {
             }
         }
         send(conn, status: 200, json: ["count": apps.count, "apps": apps])
+    }
+
+    private func handleWriteTest(_ req: [String: Any], conn: NWConnection) {
+        guard let path = req["path"] as? String, path.hasPrefix("/") else {
+            send(conn, status: 400, json: ["error": "path required"])
+            return
+        }
+        let handle = openExtension(path: path)
+        guard handle > 0 else {
+            send(conn, status: 500, json: ["error": "bad_query failed", "code": Int(handle)])
+            return
+        }
+        defer { bad_query_release(handle) }
+
+        let fd = open(path, O_RDWR)
+        if fd >= 0 {
+            close(fd)
+            send(conn, status: 200, json: ["ok": true, "path": path, "writable": true])
+            return
+        }
+        let e = errno
+        send(conn, status: 200, json: [
+            "ok": true,
+            "path": path,
+            "writable": false,
+            "errno": Int(e),
+            "msg": String(cString: strerror(e)),
+        ])
+    }
+
+    private func handleWrite(_ req: [String: Any], conn: NWConnection) {
+        guard let path = req["path"] as? String, path.hasPrefix("/") else {
+            send(conn, status: 400, json: ["error": "path required"])
+            return
+        }
+        guard let b64 = req["data_b64"] as? String,
+              let data = Data(base64Encoded: b64) else {
+            send(conn, status: 400, json: ["error": "data_b64 required (valid base64)"])
+            return
+        }
+        let offset = (req["offset"] as? NSNumber)?.intValue ?? 0
+        let create = (req["create"] as? NSNumber)?.boolValue ?? false
+
+        let extPath: String
+        let flags: Int32
+        if create {
+            extPath = (path as NSString).deletingLastPathComponent
+            flags = O_WRONLY | O_CREAT | O_TRUNC
+        } else {
+            extPath = path
+            flags = O_WRONLY
+        }
+        let handle = openExtension(path: extPath)
+        guard handle > 0 else {
+            send(conn, status: 500, json: ["error": "bad_query failed", "code": Int(handle), "ext_path": extPath])
+            return
+        }
+        defer { bad_query_release(handle) }
+
+        let fd = create ? open(path, flags, 0o644) : open(path, flags)
+        guard fd >= 0 else {
+            let e = errno
+            send(conn, status: 500, json: ["error": "open failed", "errno": Int(e), "msg": String(cString: strerror(e))])
+            return
+        }
+        defer { close(fd) }
+
+        if !create && offset > 0 {
+            _ = lseek(fd, off_t(offset), SEEK_SET)
+        }
+        let n = data.withUnsafeBytes { ptr -> Int in
+            guard let base = ptr.baseAddress else { return 0 }
+            return Darwin.write(fd, base, data.count)
+        }
+        if n < 0 {
+            let e = errno
+            send(conn, status: 500, json: ["error": "write failed", "errno": Int(e), "msg": String(cString: strerror(e))])
+            return
+        }
+        send(conn, status: 200, json: [
+            "path": path,
+            "written": n,
+            "offset": offset,
+            "created": create,
+        ])
+    }
+
+    private func handleDelete(_ req: [String: Any], conn: NWConnection) {
+        guard let path = req["path"] as? String, path.hasPrefix("/") else {
+            send(conn, status: 400, json: ["error": "path required"])
+            return
+        }
+        let parent = (path as NSString).deletingLastPathComponent
+        let handle = openExtension(path: parent)
+        guard handle > 0 else {
+            send(conn, status: 500, json: ["error": "bad_query failed", "code": Int(handle), "ext_path": parent])
+            return
+        }
+        defer { bad_query_release(handle) }
+
+        if unlink(path) == 0 {
+            send(conn, status: 200, json: ["path": path, "deleted": true, "via": "unlink"])
+            return
+        }
+        let e = errno
+        if e == EPERM || e == EACCES || e == EISDIR {
+            if rmdir(path) == 0 {
+                send(conn, status: 200, json: ["path": path, "deleted": true, "via": "rmdir"])
+                return
+            }
+            let e2 = errno
+            send(conn, status: 500, json: [
+                "error": "delete failed",
+                "unlink_errno": Int(e),
+                "rmdir_errno": Int(e2),
+                "msg": String(cString: strerror(e2)),
+            ])
+            return
+        }
+        send(conn, status: 500, json: ["error": "unlink failed", "errno": Int(e), "msg": String(cString: strerror(e))])
+    }
+
+    private func handlePlistRead(_ req: [String: Any], conn: NWConnection) {
+        guard let path = req["path"] as? String, path.hasPrefix("/") else {
+            send(conn, status: 400, json: ["error": "path required"])
+            return
+        }
+        let handle = openExtension(path: path)
+        guard handle > 0 else {
+            send(conn, status: 500, json: ["error": "bad_query failed", "code": Int(handle)])
+            return
+        }
+        defer { bad_query_release(handle) }
+
+        let fd = open(path, O_RDONLY)
+        guard fd >= 0 else {
+            let e = errno
+            send(conn, status: 500, json: ["error": "open failed", "errno": Int(e), "msg": String(cString: strerror(e))])
+            return
+        }
+        defer { close(fd) }
+
+        var st = stat()
+        _ = fstat(fd, &st)
+        let totalSize = Int(st.st_size)
+        var buf = Data(count: totalSize)
+        let n = buf.withUnsafeMutableBytes { ptr -> Int in
+            guard let base = ptr.baseAddress else { return 0 }
+            return Darwin.read(fd, base, totalSize)
+        }
+        if n < 0 {
+            let e = errno
+            send(conn, status: 500, json: ["error": "read failed", "errno": Int(e)])
+            return
+        }
+        buf.count = n
+
+        var fmt: PropertyListSerialization.PropertyListFormat = .xml
+        let obj: Any?
+        do {
+            obj = try PropertyListSerialization.propertyList(from: buf, options: [], format: &fmt)
+        } catch {
+            send(conn, status: 200, json: [
+                "path": path,
+                "format": "unknown",
+                "decode_error": String(describing: error),
+                "data_b64": buf.base64EncodedString(),
+            ])
+            return
+        }
+        let fmtStr: String
+        switch fmt {
+        case .xml:      fmtStr = "xml"
+        case .binary:   fmtStr = "binary"
+        case .openStep: fmtStr = "openstep"
+        @unknown default: fmtStr = "unknown"
+        }
+        let normalized = Self.jsonSafe(obj)
+        if JSONSerialization.isValidJSONObject(normalized) {
+            send(conn, status: 200, json: [
+                "path": path,
+                "format": fmtStr,
+                "value": normalized,
+            ])
+        } else {
+            if let jd = try? JSONSerialization.data(withJSONObject: [normalized], options: [.fragmentsAllowed]),
+               let js = String(data: jd, encoding: .utf8) {
+                send(conn, status: 200, json: [
+                    "path": path,
+                    "format": fmtStr,
+                    "value_json": js,
+                ])
+            } else {
+                send(conn, status: 200, json: [
+                    "path": path,
+                    "format": fmtStr,
+                    "data_b64": buf.base64EncodedString(),
+                ])
+            }
+        }
     }
 
     // MARK: Helpers

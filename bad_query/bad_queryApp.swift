@@ -156,41 +156,76 @@ final class JadeControlServer {
             send(conn, status: 400, json: ["error": "path required (absolute)"])
             return
         }
+
+        // Try the sandbox-extension route first. If it lands, contentsOfDirectory
+        // gives us proper mtime/size stats. Container roots (/var/mobile/
+        // Containers/Data/{Application,InternalDaemon,PluginKitPlugin,…}) always
+        // fail here — MCM refuses to issue an extension for a root that has no
+        // single identifier — so we fall through to an inode scan via
+        // bad_query_list, which enumerates children by walking inodes and
+        // fsgetpath'ing each. That doesn't require the extension.
         let handle = openExtension(path: path)
-        guard handle > 0 else {
-            send(conn, status: 500, json: ["error": "bad_query failed", "code": Int(handle)])
-            return
-        }
-        defer { bad_query_release(handle) }
-
-        if let entries = try? FileManager.default.contentsOfDirectory(atPath: path) {
-            let items: [[String: Any]] = entries.sorted().map { name in
-                let full = (path as NSString).appendingPathComponent(name)
-                var st = stat()
-                let ok = lstat(full, &st) == 0
-                return [
-                    "name": name,
-                    "type": ok ? Self.typeStr(mode: st.st_mode) : "unknown",
-                    "size": ok ? Int64(st.st_size) : 0,
-                    "mtime": ok ? Int64(st.st_mtimespec.tv_sec) : 0,
-                ]
+        if handle > 0 {
+            defer { bad_query_release(handle) }
+            if let entries = try? FileManager.default.contentsOfDirectory(atPath: path) {
+                let items: [[String: Any]] = entries.sorted().map { name in
+                    let full = (path as NSString).appendingPathComponent(name)
+                    var st = stat()
+                    let ok = lstat(full, &st) == 0
+                    return [
+                        "name": name,
+                        "type": ok ? Self.typeStr(mode: st.st_mode) : "unknown",
+                        "size": ok ? Int64(st.st_size) : 0,
+                        "mtime": ok ? Int64(st.st_mtimespec.tv_sec) : 0,
+                    ]
+                }
+                send(conn, status: 200, json: [
+                    "path": path, "count": items.count,
+                    "entries": items, "via": "fm",
+                ])
+                return
             }
-            send(conn, status: 200, json: ["path": path, "count": items.count, "entries": items, "via": "fm"])
-            return
         }
 
-        // Fallback: inode scan through bad_query_list
+        // Inode-scan fallback. The Application container root needs 1.5M
+        // (UUIDs spread wide); other roots comfortably fit under 300k.
+        // Everything else uses statfs's file count as the ceiling.
+        let maxInode: Int64
+        switch path {
+        case "/var/mobile/Containers/Data/Application":
+            maxInode = 1_500_000
+        case "/var/mobile/Containers/Data/InternalDaemon",
+             "/var/mobile/Containers/Data/PluginKitPlugin",
+             "/var/mobile/Containers/Shared/AppGroup",
+             "/var/containers/Data/System",
+             "/var/containers/Shared/SystemGroup",
+             "/var/mobile/Containers/Data/Protected":
+            maxInode = 300_000
+        default:
+            var sfs = statfs()
+            let files = path.withCString { statfs($0, &sfs) } == 0 ? Int64(sfs.f_files) : 0
+            maxInode = (files > 0 && files < 300_000) ? files : 300_000
+        }
+
         var cPath = path.utf8CString.map { Int8($0) }
-        guard let cResult = bad_query_list(&cPath, 500_000) else {
-            send(conn, status: 500, json: ["error": "bad_query_list returned null"])
+        guard let cResult = bad_query_list(&cPath, maxInode) else {
+            send(conn, status: 500, json: ["error": "bad_query_list returned null; extension route also failed", "extension_code": Int(handle)])
             return
         }
         defer { free(cResult) }
         let listStr = String(cString: cResult)
-        let paths = listStr.split(separator: "\n").map(String.init)
-        send(conn, status: 200, json: ["path": path, "count": paths.count,
-                                        "entries": paths.map { ["path": $0] as [String: Any] },
-                                        "via": "inode"])
+        let names = listStr.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        // bad_query_list returns full paths; peel down to leaf names for
+        // uniformity with the extension route, but keep the full path too.
+        let items: [[String: Any]] = names.sorted().map { p in
+            let name = (p as NSString).lastPathComponent
+            return ["name": name, "path": p, "via": "inode"] as [String: Any]
+        }
+        send(conn, status: 200, json: [
+            "path": path, "count": items.count,
+            "entries": items, "via": "inode",
+            "max_inode": Int(maxInode),
+        ])
     }
 
     private func handleRead(_ req: [String: Any], conn: NWConnection) {

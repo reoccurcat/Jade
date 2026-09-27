@@ -652,40 +652,73 @@ final class JadeControlServer {
             send(conn, status: 400, json: ["error": "cmd required"])
             return
         }
-        let timeout = (req["timeout"] as? NSNumber)?.doubleValue ?? 30.0
+        let timeoutSecs = (req["timeout"] as? NSNumber)?.doubleValue ?? 30.0
 
-        let pipe = Pipe()
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
-        proc.arguments = ["-c", cmd]
-        proc.standardOutput = pipe
-        proc.standardError = pipe
+        var fds = [Int32](repeating: 0, count: 2)
+        guard pipe(&fds) == 0 else {
+            send(conn, status: 500, json: ["error": "pipe failed", "errno": Int(errno)])
+            return
+        }
+        let readFd = fds[0], writeFd = fds[1]
 
-        do {
-            try proc.run()
-        } catch {
-            send(conn, status: 500, json: ["error": "spawn failed", "msg": error.localizedDescription])
+        var fa: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&fa)
+        posix_spawn_file_actions_addclose(&fa, readFd)
+        posix_spawn_file_actions_adddup2(&fa, writeFd, STDOUT_FILENO)
+        posix_spawn_file_actions_adddup2(&fa, writeFd, STDERR_FILENO)
+        posix_spawn_file_actions_addclose(&fa, writeFd)
+
+        let sh = "/bin/sh"
+        var cSh = sh.utf8CString.map { Int8($0) }
+        var cFlag = "-c".utf8CString.map { Int8($0) }
+        var cCmd = cmd.utf8CString.map { Int8($0) }
+        var pid: pid_t = 0
+        let rc = cSh.withUnsafeMutableBufferPointer { shp in
+            cFlag.withUnsafeMutableBufferPointer { flagp in
+                cCmd.withUnsafeMutableBufferPointer { cmdp in
+                    var argv: [UnsafeMutablePointer<Int8>?] = [shp.baseAddress, flagp.baseAddress, cmdp.baseAddress, nil]
+                    return posix_spawn(&pid, shp.baseAddress, &fa, nil, &argv, nil)
+                }
+            }
+        }
+        posix_spawn_file_actions_destroy(&fa)
+        close(writeFd)
+
+        guard rc == 0 else {
+            close(readFd)
+            send(conn, status: 500, json: ["error": "posix_spawn failed", "errno": Int(rc)])
             return
         }
 
-        let deadline = DispatchTime.now() + timeout
+        // Read output with timeout via background thread + DispatchGroup
+        var output = Data()
         let group = DispatchGroup()
         group.enter()
-        var output = Data()
         DispatchQueue.global().async {
-            output = pipe.fileHandleForReading.readDataToEndOfFile()
+            var buf = Data(count: 65536)
+            while true {
+                let n = buf.withUnsafeMutableBytes { ptr -> Int in
+                    guard let base = ptr.baseAddress else { return 0 }
+                    return Darwin.read(readFd, base, ptr.count)
+                }
+                if n <= 0 { break }
+                output.append(buf.prefix(n))
+            }
             group.leave()
         }
-        let waited = group.wait(timeout: deadline)
-        if waited == .timedOut {
-            proc.terminate()
-        }
-        let exitCode = proc.terminationStatus
+        let timedOut = group.wait(timeout: .now() + timeoutSecs) == .timedOut
+        if timedOut { kill(pid, SIGKILL) }
+        close(readFd)
+
+        var wstatus: Int32 = 0
+        waitpid(pid, &wstatus, 0)
+        // Extract exit code: bits 8-15 when process exited normally
+        let exitCode = (wstatus >> 8) & 0xff
 
         send(conn, status: 200, json: [
             "cmd": cmd,
-            "exit": Int(exitCode),
-            "timed_out": waited == .timedOut,
+            "exit": exitCode,
+            "timed_out": timedOut,
             "output": String(data: output, encoding: .utf8) ?? output.base64EncodedString(),
             "output_b64": output.base64EncodedString(),
         ])
